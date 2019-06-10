@@ -3,13 +3,21 @@ package main
 import (
 	"fmt"
 	"strconv"
-	"strings"
-	"time"
-
 	"github.com/gocolly/colly"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
+	"log"
+	"strings"
+	"time"
+	"github.com/kelseyhightower/envconfig"
 )
+
+type Config struct {
+	DbHost string `required:"true" split_words:"true"`
+	DbName string `required:"true" split_words:"true"`
+	DbUser string `required:"true" split_words:"true"`
+	DbPw   string `required:"true" split_words:"true"`
+}
 
 // Match to be stored in the database.
 type Match struct {
@@ -28,14 +36,7 @@ func bod(t time.Time) time.Time {
 	return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
 }
 
-// MatchExists checks if a match already exists based on date and hometeam.
-func (m Match) MatchExists(db *gorm.DB) bool {
-	var match Match
-	dayStart := bod(*m.StartTime)
-	dayEnd := dayStart.Add(24 * time.Hour)
-	result := db.Table("match").Select("*").Where("start_time >= ? AND start_time < ? AND home_team = ?", dayStart, dayEnd, m.HomeTeam).Scan(&match)
-	return !result.RecordNotFound()
-}
+var cfg Config
 
 func replaceMonth(date string) (*time.Time, error) {
 	months := map[string]string{
@@ -67,17 +68,27 @@ func replaceMonth(date string) (*time.Time, error) {
 }
 
 func main() {
-	// Connect to database
+	err := envconfig.Process("attendance", &cfg)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	dbConnectString := fmt.Sprintf("host=%s port=5432 user=%s dbname=%s password=%s sslmode=disable",
+		cfg.DbHost, cfg.DbUser, cfg.DbName, cfg.DbPw)
+	//conect to db
 	db, err := gorm.Open(
 		"postgres",
-		"host=localhost port=5432 user=postgres dbname=attendance password=docker sslmode=disable",
+		dbConnectString,
 	)
+	// Connect to database
 	defer db.Close()
+	db.SingularTable(true)
 	if err != nil {
 		panic(err.Error())
 	}
 	// Instantiate collector
-	c := colly.NewCollector()
+	c := colly.NewCollector(
+		colly.MaxDepth(2),
+	)
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "bold.dk/fodbold/*",
 		Delay:       2 * time.Second,
@@ -99,7 +110,12 @@ func main() {
 	})
 	c.OnHTML("#match_update", func(e *colly.HTMLElement) {
 		match := Match{}
-		matchTeams := strings.Split(e.ChildAttr(`meta[itemprop="name"]`, "content"), " - ")
+		matchTeams := make([]string, 0, 2)
+		e.ForEach("table.match", func(_ int, elem *colly.HTMLElement) {
+			elem.ForEach("span", func(_ int, span *colly.HTMLElement) {
+				matchTeams = append(matchTeams, span.Text)
+			})
+		})
 		match.HomeTeam = matchTeams[0]
 		match.AwayTeam = matchTeams[1]
 		e.ForEach("div.info_box", func(_ int, elem *colly.HTMLElement) {
@@ -128,11 +144,10 @@ func main() {
 				match.State = elem.ChildText("div.result")
 			}
 		})
-		// Only add match to DB if it isn't already there.
-		if match.MatchExists(db) {
-			return
-		}
-		result := db.Table("match").Create(&match)
+		dayStart := bod(*match.StartTime)
+		dayEnd := dayStart.Add(24 * time.Hour)
+		var oldMatch Match
+		result := db.Where("start_time >= ? AND start_time < ? AND home_team = ?", dayStart, dayEnd, match.HomeTeam).Assign(&match).FirstOrCreate(&oldMatch)
 		if result.Error != nil {
 			fmt.Printf("Failed to store %+v", match)
 		}
