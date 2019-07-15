@@ -2,13 +2,14 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strconv"
+	"strings"
+	"time"
+
 	"github.com/gocolly/colly"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
-	"log"
-	"strings"
-	"time"
 	"github.com/kelseyhightower/envconfig"
 )
 
@@ -68,32 +69,38 @@ func replaceMonth(date string) (*time.Time, error) {
 }
 
 func main() {
+	// Sleep to get cloudsql proxy ready. TODO: Fix by having a cloudsql proxy service instead of sidecar.
+	// Sidecar cloudsql doesn't work with k8s cronjob.
+	time.Sleep(5 * time.Second)
 	err := envconfig.Process("attendance", &cfg)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	dbConnectString := fmt.Sprintf("host=%s port=5432 user=%s dbname=%s password=%s sslmode=disable",
+	dbConnectString := fmt.Sprintf("host=%s user=%s dbname=%s password=%s sslmode=disable",
 		cfg.DbHost, cfg.DbUser, cfg.DbName, cfg.DbPw)
 	//conect to db
 	db, err := gorm.Open(
 		"postgres",
 		dbConnectString,
 	)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 	// Connect to database
 	defer db.Close()
 	db.SingularTable(true)
-	if err != nil {
-		panic(err.Error())
-	}
 	// Instantiate collector
 	c := colly.NewCollector(
 		colly.MaxDepth(2),
 	)
-	c.Limit(&colly.LimitRule{
+	err = c.Limit(&colly.LimitRule{
 		DomainGlob:  "bold.dk/fodbold/*",
 		Delay:       2 * time.Second,
 		RandomDelay: 1 * time.Second,
 	})
+	if err != nil {
+		fmt.Printf("call to colly Limit failed")
+	}
 	teamName := "fc-koebenhavn"
 
 	// On every a element which has href attribute call callback
@@ -105,7 +112,10 @@ func main() {
 			if teams[0]+"-"+teams[1]+"-"+teams[2] != teamName+"-"+"vs" {
 				return
 			}
-			e.Request.Visit(link)
+			err = e.Request.Visit(link)
+			if err != nil {
+				fmt.Printf("Failed to visit link")
+			}
 		}
 	})
 	c.OnHTML("#match_update", func(e *colly.HTMLElement) {
@@ -153,5 +163,8 @@ func main() {
 		}
 		fmt.Println("Match done")
 	})
-	c.Visit("https://www.bold.dk/fodbold/kampe/danmark/")
+	err = c.Visit("https://www.bold.dk/fodbold/kampe/danmark/")
+	if err != nil {
+		panic(err.Error())
+	}
 }

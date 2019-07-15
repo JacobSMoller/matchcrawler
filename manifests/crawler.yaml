@@ -1,0 +1,50 @@
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: matchcrawler
+  namespace: attendance
+  labels:
+    app: matchcrawler
+spec:
+  schedule: "*/1 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: matchcrawler
+            image: quay.io/jacob_moeller/matchcrawler:withsleep
+            env:
+              - name: ATTENDANCE_DB_HOST
+                value: "127.0.0.1"
+              - name: ATTENDANCE_DB_NAME
+                value: "attendance"
+              - name: ATTENDANCE_DB_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: psql-secret
+                    key: username
+              - name: ATTENDANCE_DB_PW
+                valueFrom:
+                  secretKeyRef:
+                    name: psql-secret
+                    key: password
+          - name: cloudsql-proxy
+            image: gcr.io/cloudsql-docker/gce-proxy:1.14
+            command: ["/cloud_sql_proxy",
+                      "-instances=sincere-charmer-233912:europe-north1:attendance=tcp:5432",
+                      "-credential_file=/secrets/cloudsql/credentials.json"]
+            securityContext:
+              runAsUser: 2
+              allowPrivilegeEscalation: false
+            volumeMounts:
+              - name: cloudsql-instance-credentials
+                mountPath: /secrets/cloudsql
+                readOnly: true
+          volumes:
+            - name: cloudsql-instance-credentials
+              secret:
+                secretName: cloudsql-instance-credentials
+          restartPolicy: Never
+
+
