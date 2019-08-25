@@ -1,43 +1,30 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"log"
+	"io/ioutil"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gocolly/colly"
-	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
-	"github.com/kelseyhightower/envconfig"
 )
-
-type Config struct {
-	DbHost string `required:"true" split_words:"true"`
-	DbName string `required:"true" split_words:"true"`
-	DbUser string `required:"true" split_words:"true"`
-	DbPw   string `required:"true" split_words:"true"`
-}
 
 // Match to be stored in the database.
 type Match struct {
-	Tournament string     `gorm:"tournament"`
-	StartTime  *time.Time `gorm:"start_time"`
-	Spectators *int       `gorm:"spectators"`
-	State      string     `gorm:"state"`
-	Referee    string     `gorm:"referee"`
-	HomeTeam   string     `gorm:"home_team"`
-	AwayTeam   string     `gorm:"away_team"`
+	ID         int        `gorm:"id" json:"id"`
+	Tournament string     `gorm:"tournament" json:"tournament"`
+	StartTime  *time.Time `gorm:"start_time" json:"start_time"`
+	Spectators *int       `gorm:"spectators" json:"spectators"`
+	State      string     `gorm:"state" json:"state"`
+	Referee    string     `gorm:"referee" json:"referee"`
+	HomeTeam   string     `gorm:"home_team" json:"home_team"`
+	AwayTeam   string     `gorm:"away_team" json:"away_team"`
 }
-
-// returns date at beginning of day.
-func bod(t time.Time) time.Time {
-	year, month, day := t.Date()
-	return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
-}
-
-var cfg Config
 
 func replaceMonth(date string) (*time.Time, error) {
 	months := map[string]string{
@@ -68,32 +55,43 @@ func replaceMonth(date string) (*time.Time, error) {
 	return &parsed, nil
 }
 
+func createCall(client *http.Client, match *Match) {
+	jsonMatch, err := json.Marshal(match)
+	if err != nil {
+		fmt.Println("Could not marshal match to json")
+	}
+	req, err := http.NewRequest("POST", "https://74ca51f0.ngrok.io/match/create", bytes.NewBuffer(jsonMatch))
+	if err != nil {
+		panic("Could not create http request")
+	}
+	_, err = client.Do(req)
+	if err != nil {
+		panic("Error during call to create match")
+	}
+}
+
+func updateCall(client *http.Client, match *Match) {
+	jsonMatch, err := json.Marshal(match)
+	if err != nil {
+		fmt.Println("Could not marshal match to json")
+	}
+	req, err := http.NewRequest("PUT", "https://74ca51f0.ngrok.io/match/update", bytes.NewBuffer(jsonMatch))
+	if err != nil {
+		panic("Could not create http request")
+	}
+	_, err = client.Do(req)
+	if err != nil {
+		panic("Error during call to create match")
+	}
+}
+
 func main() {
-	// Sleep to get cloudsql proxy ready. TODO: Fix by having a cloudsql proxy service instead of sidecar.
-	// Sidecar cloudsql doesn't work with k8s cronjob.
-	time.Sleep(5 * time.Second)
-	err := envconfig.Process("attendance", &cfg)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	dbConnectString := fmt.Sprintf("host=%s user=%s dbname=%s password=%s sslmode=disable",
-		cfg.DbHost, cfg.DbUser, cfg.DbName, cfg.DbPw)
-	//conect to db
-	db, err := gorm.Open(
-		"postgres",
-		dbConnectString,
-	)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	// Connect to database
-	defer db.Close()
-	db.SingularTable(true)
+	client := &http.Client{Timeout: time.Second * 5}
 	// Instantiate collector
 	c := colly.NewCollector(
 		colly.MaxDepth(2),
 	)
-	err = c.Limit(&colly.LimitRule{
+	err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "bold.dk/fodbold/*",
 		Delay:       2 * time.Second,
 		RandomDelay: 1 * time.Second,
@@ -102,7 +100,6 @@ func main() {
 		fmt.Printf("call to colly Limit failed")
 	}
 	teamName := "fc-koebenhavn"
-
 	// On every a element which has href attribute call callback
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		link := e.Attr("href")
@@ -114,12 +111,19 @@ func main() {
 			}
 			err = e.Request.Visit(link)
 			if err != nil {
-				fmt.Printf("Failed to visit link")
+				fmt.Printf("Failed to visit link %s %s \n", link, err.Error())
 			}
 		}
 	})
 	c.OnHTML("#match_update", func(e *colly.HTMLElement) {
+		splitLink := strings.Split(e.Request.URL.Path, "/")
+		// -2 to offset .Path ending with /.
+		matchID, err := strconv.Atoi(splitLink[len(splitLink)-2])
+		if err != nil {
+			fmt.Println("Failed to parse matchID to int")
+		}
 		match := Match{}
+		match.ID = matchID
 		matchTeams := make([]string, 0, 2)
 		e.ForEach("table.match", func(_ int, elem *colly.HTMLElement) {
 			elem.ForEach("span", func(_ int, span *colly.HTMLElement) {
@@ -154,12 +158,32 @@ func main() {
 				match.State = elem.ChildText("div.result")
 			}
 		})
-		dayStart := bod(*match.StartTime)
-		dayEnd := dayStart.Add(24 * time.Hour)
-		var oldMatch Match
-		result := db.Where("start_time >= ? AND start_time < ? AND home_team = ?", dayStart, dayEnd, match.HomeTeam).Assign(&match).FirstOrCreate(&oldMatch)
-		if result.Error != nil {
-			fmt.Printf("Failed to store %+v", match)
+
+		getMatchURL := fmt.Sprintf("https://74ca51f0.ngrok.io/match/%d", match.ID)
+		resp, err := client.Get(getMatchURL)
+		if err != nil {
+			panic("Error during get match call")
+		}
+		if resp.StatusCode == 404 {
+			fmt.Println("Creating match")
+			createCall(client, &match)
+		} else {
+			b, err := ioutil.ReadAll(resp.Body)
+			defer resp.Body.Close()
+			if err != nil {
+				panic("Failed to read response body")
+			}
+			var existingMatch Match
+			err = json.Unmarshal(b, &existingMatch)
+			if err != nil {
+				panic("Failed to unmarshal existing match json")
+			}
+			existingState := strings.Split(existingMatch.State, " ")[0]
+			currentStaste := strings.Split(match.State, " ")[0]
+			if existingState != "Færdig" && currentStaste == "Færdig" {
+				fmt.Println("Updating match")
+				updateCall(client, &match)
+			}
 		}
 		fmt.Println("Match done")
 	})
